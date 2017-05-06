@@ -3,9 +3,21 @@
 declare(strict_types=1);
 
 use Prooph\Workshop\Infrastructure;
+use Prooph\Workshop\Model\Command;
+use Prooph\Workshop\Model\Event;
 
+/**
+ * All dependencies are set up by simple callable factories.
+ *
+ * The factories are stored in the map and can be invoked by dependent factories.
+ */
 $factories = [];
 
+/**
+ * Postgres PDO connection used by event store
+ *
+ * @return PDO
+ */
 $factories['pdoConnection'] = function (): PDO {
     static $connection;
 
@@ -15,6 +27,11 @@ $factories['pdoConnection'] = function (): PDO {
     return $connection;
 };
 
+/**
+ * MongoDB connection used by projections, snapshots and read model
+ *
+ * @return Infrastructure\MongoDb\MongoConnection
+ */
 $factories['mongoConnection'] = function (): Infrastructure\MongoDb\MongoConnection {
     static $mongoConnection;
 
@@ -25,25 +42,14 @@ $factories['mongoConnection'] = function (): Infrastructure\MongoDb\MongoConnect
     return $mongoConnection;
 };
 
-$factories['eventStore'] = function () use ($factories): \Prooph\EventStore\EventStore {
-    static $eventStore = null;
-    if (null === $eventStore) {
-        $eventStore = new \Prooph\EventStore\Pdo\PostgresEventStore(
-            new \Prooph\Common\Messaging\FQCNMessageFactory(),
-            $factories['pdoConnection'](),
-            new \Prooph\EventStore\Pdo\PersistenceStrategy\PostgresSingleStreamStrategy()
-        );
-    }
-    return $eventStore;
-};
-
-$factories['snapshotStore'] = function () use ($factories): \Prooph\SnapshotStore\SnapshotStore {
-    $mongoConnection = $factories['mongoConnection']();
-    /** @var Infrastructure\MongoDb\MongoConnection $mongoConnection */
-    return new Prooph\SnapshotStore\MongoDb\MongoDbSnapshotStore($mongoConnection->client(), $mongoConnection->dbName());
-};
-
-$factories['messageFactory'] = function () use($factories): \Prooph\Common\Messaging\MessageFactory {
+/**
+ * Message factory that uses a simple convention to map message names to FQCNs
+ *
+ * Internally the message factory delegates message creation to the prooph FQCNMessageFactory
+ *
+ * @return \Prooph\Common\Messaging\MessageFactory
+ */
+$factories['messageFactory'] = function () use(&$factories): \Prooph\Common\Messaging\MessageFactory {
     static $messageFactory;
 
     if(!$messageFactory) {
@@ -67,19 +73,88 @@ $factories['messageFactory'] = function () use($factories): \Prooph\Common\Messa
     return $messageFactory;
 };
 
-$factories['messageHandler'] = [
+/**
+ * Event store configured with a SingleStreamStrategy (we store all events in "event_stream")
+ *
+ * @return \Prooph\EventStore\EventStore
+ */
+$factories['eventStore'] = function () use (&$factories): \Prooph\EventStore\EventStore {
+    static $eventStore = null;
+    if (null === $eventStore) {
+        $eventStore = new \Prooph\EventStore\TransactionalActionEventEmitterEventStore(
+            new \Prooph\EventStore\Pdo\PostgresEventStore(
+                $factories['messageFactory'](),
+                $factories['pdoConnection'](),
+                new \Prooph\EventStore\Pdo\PersistenceStrategy\PostgresSingleStreamStrategy()
+            ),
+            new \Prooph\Common\Event\ProophActionEventEmitter(
+                \Prooph\EventStore\TransactionalActionEventEmitterEventStore::ALL_EVENTS
+            )
+        );
 
+        //Publish events after event store commit
+        (new \Prooph\EventStoreBusBridge\EventPublisher(
+            $factories['eventBus']()
+        ))->attachToEventStore($eventStore);
+    }
+    return $eventStore;
+};
+
+/**
+ * Aggregate snapshot store
+ *
+ * @return \Prooph\SnapshotStore\SnapshotStore
+ */
+$factories['snapshotStore'] = function () use (&$factories): \Prooph\SnapshotStore\SnapshotStore {
+    $mongoConnection = $factories['mongoConnection']();
+    /** @var Infrastructure\MongoDb\MongoConnection $mongoConnection */
+    return new Prooph\SnapshotStore\MongoDb\MongoDbSnapshotStore($mongoConnection->client(), $mongoConnection->dbName());
+};
+
+$factories['userRepository'] = function () use(&$factories): \Prooph\Workshop\Model\User\UserRepository {
+    static $userRepository;
+
+    if(!$userRepository) {
+        $userRepository = new Infrastructure\WriteModel\ProophUserRepository(
+            $factories['eventStore'](),
+            \Prooph\EventSourcing\Aggregate\AggregateType::fromAggregateRootClass(\Prooph\Workshop\Model\User::class),
+            new \Prooph\EventSourcing\EventStoreIntegration\AggregateTranslator(),
+            $factories['snapshotStore'](),
+            new \Prooph\EventStore\StreamName('event_stream')
+        );
+    }
+
+    return $userRepository;
+};
+
+/**
+ * Map of message FQCN to handler factory
+ *
+ * In case of events FQCN can be mapped to an array of handler factories
+ */
+$factories['messageHandler'] = [
+    
 ];
 
-$factories['commandBus'] = function () use($factories): \Prooph\ServiceBus\CommandBus {
+/**
+ * Application command bus set up with a custom message router that makes use of the message map
+ *
+ * @return \Prooph\ServiceBus\CommandBus
+ */
+$factories['commandBus'] = function () use(&$factories): \Prooph\ServiceBus\CommandBus {
     static $commandBus;
 
     if(!$commandBus) {
         $commandBus = new \Prooph\ServiceBus\CommandBus();
 
+        //Each command is wrapped in a transaction
+        (new \Prooph\EventStoreBusBridge\TransactionManager(
+            $factories['eventStore']()
+        ))->attachToMessageBus($commandBus);
+
         $commandBus->attach(
             \Prooph\ServiceBus\MessageBus::EVENT_DISPATCH,
-            function(\Prooph\Common\Event\ActionEvent $dispatchEvent) use($factories): void {
+            function(\Prooph\Common\Event\ActionEvent $dispatchEvent) use(&$factories): void {
                 $messageName = $dispatchEvent->getParam(\Prooph\ServiceBus\MessageBus::EVENT_PARAM_MESSAGE_NAME);
 
                 $fqcn = Infrastructure\Util\MessageName::toFQCN($messageName);
@@ -92,27 +167,33 @@ $factories['commandBus'] = function () use($factories): \Prooph\ServiceBus\Comma
 
                 $dispatchEvent->setParam(\Prooph\ServiceBus\MessageBus::EVENT_PARAM_MESSAGE_HANDLER, $handler);
             },
-            \Prooph\ServiceBus\MessageBus::PRIORITY_LOCATE_HANDLER
+            \Prooph\ServiceBus\MessageBus::PRIORITY_ROUTE
         );
     }
 
     return $commandBus;
 };
 
-$factories['eventBus'] = function () use($factories): \Prooph\ServiceBus\EventBus {
+/**
+ * Application event bus set up with a custom event router that makes use of the message map
+ *
+ * @return \Prooph\ServiceBus\EventBus
+ */
+$factories['eventBus'] = function () use(&$factories): \Prooph\ServiceBus\EventBus {
     static $eventBus;
 
     if(!$eventBus) {
         $eventBus = new \Prooph\ServiceBus\EventBus();
         $eventBus->attach(
             \Prooph\ServiceBus\MessageBus::EVENT_DISPATCH,
-            function(\Prooph\Common\Event\ActionEvent $dispatchEvent) use($factories): void {
+            function(\Prooph\Common\Event\ActionEvent $dispatchEvent) use(&$factories): void {
                 $messageName = $dispatchEvent->getParam(\Prooph\ServiceBus\MessageBus::EVENT_PARAM_MESSAGE_NAME);
 
                 $fqcn = Infrastructure\Util\MessageName::toFQCN($messageName);
 
                 if(!isset($factories['messageHandler'][$fqcn])) {
-                    throw new \RuntimeException('No handler defined for message: ' . $messageName);
+                    $factories['logger']()->debug('No event listeners found for ' . $fqcn);
+                    return;
                 }
 
                 $listeners = $factories['messageHandler'][$fqcn]();
@@ -123,18 +204,24 @@ $factories['eventBus'] = function () use($factories): \Prooph\ServiceBus\EventBu
 
                 $dispatchEvent->setParam(\Prooph\ServiceBus\EventBus::EVENT_PARAM_EVENT_LISTENERS, $listeners);
             },
-            \Prooph\ServiceBus\MessageBus::PRIORITY_LOCATE_HANDLER
+            \Prooph\ServiceBus\MessageBus::PRIORITY_ROUTE
         );
     }
 
     return $eventBus;
 };
 
+/**
+ * Map of action middlewares
+ *
+ * @see app/router.php for routing
+ * @see public/index.php for invokation of middlewares
+ */
 $factories['http'] = [
-    \Prooph\Workshop\Http\Home::class => function() use ($factories): \Prooph\Workshop\Http\Home {
+    \Prooph\Workshop\Http\Home::class => function() use (&$factories): \Prooph\Workshop\Http\Home {
         return new \Prooph\Workshop\Http\Home();
     },
-    \Prooph\Workshop\Http\MessageBox::class => function() use ($factories): \Prooph\Workshop\Http\MessageBox {
+    \Prooph\Workshop\Http\MessageBox::class => function() use (&$factories): \Prooph\Workshop\Http\MessageBox {
         return new \Prooph\Workshop\Http\MessageBox(
             $factories['commandBus'](),
             $factories['eventBus'](),
@@ -143,7 +230,12 @@ $factories['http'] = [
     }
 ];
 
-$factories['logger'] = function () use ($factories): \Psr\Log\LoggerInterface {
+/**
+ * PSR Logger
+ *
+ * @return \Psr\Log\LoggerInterface
+ */
+$factories['logger'] = function () use (&$factories): \Psr\Log\LoggerInterface {
     static $logger;
 
     if(!$logger) {

@@ -27,6 +27,13 @@ final class MessageName
         throw new InvalidArgumentException('Unknown message name: ' . $messageName, 400, 'message_name', $messageName);
     }
 
+    public static function toMessageName(string $fqcn): string
+    {
+        $parts = explode('\\', $fqcn);
+
+        return array_pop($parts);
+    }
+
     private function __construct()
     {
         //static usage only

@@ -27,10 +27,6 @@ $app->pipe($errorHandler);
 
 $app->pipe(new \Zend\Expressive\Helper\BodyParams\BodyParamsMiddleware());
 
-$app->pipe('/', function(Request $req, \Interop\Http\Middleware\DelegateInterface $delegate) use($factories) {
-    return $factories['http'][\Prooph\Workshop\Http\Home::class]()->process($req, $delegate);
-});
-
 $app->pipe('/api/v1', function (Request $req, \Interop\Http\Middleware\DelegateInterface $delegate) use($factories) {
     /** @var FastRoute\Dispatcher $router */
     $router = require 'app/router.php';
@@ -57,6 +53,10 @@ $app->pipe('/api/v1', function (Request $req, \Interop\Http\Middleware\DelegateI
     $httpHandler = $factories['http'][$route[1]]();
 
     return $httpHandler->process($req, $delegate);
+});
+
+$app->pipe('/', function(Request $req, \Interop\Http\Middleware\DelegateInterface $delegate) use($factories) {
+    return $factories['http'][\Prooph\Workshop\Http\Home::class]()->process($req, $delegate);
 });
 
 $app->pipe(new \Zend\Stratigility\Middleware\NotFoundHandler(new Zend\Diactoros\Response()));
