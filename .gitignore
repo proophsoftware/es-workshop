@@ -7,9 +7,4 @@ nbproject
 .php_cs.cache
 .project
 .settings
-src/Model/Command/*
-src/Model/Event/*
-!src/Model/Command/.gitkeep
-!src/Model/Event/.gitkeep
-!src/Model/Event/DomainEvent.php
 vendor

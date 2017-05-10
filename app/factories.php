@@ -127,13 +127,52 @@ $factories['userRepository'] = function () use(&$factories): \Prooph\Workshop\Mo
     return $userRepository;
 };
 
+$factories['configRepository'] = function () use(&$factories): \Prooph\Workshop\Model\Configuration\ConfigurationRepository {
+    static $repository;
+
+    if(!$repository) {
+        $repository = new Infrastructure\WriteModel\ProophConfigurationRepository(
+            $factories['eventStore'](),
+            \Prooph\EventSourcing\Aggregate\AggregateType::fromAggregateRootClass(\Prooph\Workshop\Model\Configuration::class),
+            new \Prooph\EventSourcing\EventStoreIntegration\AggregateTranslator(),
+            $factories['snapshotStore'](),
+            new \Prooph\EventStore\StreamName('event_stream')
+        );
+    }
+
+    return $repository;
+};
+
 /**
  * Map of message FQCN to handler factory
  *
  * In case of events FQCN can be mapped to an array of handler factories
  */
 $factories['messageHandler'] = [
-    
+    Command\RegisterUser::class => function() use(&$factories) {
+        return new Command\RegisterUserHandler($factories['userRepository']());
+    },
+    Command\ChangeUsername::class => function() use(&$factories) {
+        return new Command\ChangeUsernameHandler($factories['userRepository']());
+    },
+    Command\StartNewConfig::class => function() use(&$factories) {
+        return new Command\StartNewConfigHandler(
+            $factories['userRepository'](),
+            $factories['configRepository']()
+        );
+    },
+    Event\UserWasRegistered::class => function() use(&$factories) {
+        return [
+            new \Prooph\Workshop\ReadModel\UserProjector($factories['mongoConnection']()),
+            new \Prooph\Workshop\Model\ProcessManager\UserConfigurationStarter(
+                $factories['commandBus'](),
+                $factories['messageFactory']()
+            )
+        ];
+    },
+    Event\UsernameWasChanged::class => function() use(&$factories) {
+        return new \Prooph\Workshop\ReadModel\UserProjector($factories['mongoConnection']());
+    },
 ];
 
 /**
